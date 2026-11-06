@@ -29,9 +29,20 @@ import (
 // checkGPUOperatorVersion detects the deployed GPU operator version and evaluates
 // it against the constraint from the recipe (if present).
 func checkGPUOperatorVersion(ctx *validators.Context) error {
-	version, err := getGPUOperatorVersion(ctx.Ctx, ctx.Clientset)
+	version, pinnedImage, err := getGPUOperatorVersion(ctx.Ctx, ctx.Clientset)
 	if err != nil {
 		return errors.Wrap(errors.ErrCodeInternal, "failed to detect GPU operator version", err)
+	}
+
+	// A digest-only image reference carries no version, and a digest is not a
+	// version to compare. Report the version as unknown rather than evaluating
+	// the digest as one.
+	if version == "" && pinnedImage != "" {
+		fmt.Printf("Detected GPU Operator version: unknown (digest-pinned image %s)\n", pinnedImage)
+		return validators.SkipWithReason(validators.SkipReasonVersionUnknown,
+			fmt.Sprintf("GPU Operator version unknown (digest-pinned): image %s has no tag, and the deployment "+
+				"has no app.kubernetes.io/version label or nvidia.com/gpu-operator-version annotation; "+
+				"version constraint not evaluated", pinnedImage))
 	}
 
 	fmt.Printf("Detected GPU Operator version: %s\n", version)
@@ -79,16 +90,23 @@ func findDeploymentConstraint(ctx *validators.Context, name string) (string, boo
 	return "", false
 }
 
-func getGPUOperatorVersion(ctx context.Context, clientset kubernetes.Interface) (string, error) {
+// getGPUOperatorVersion returns the deployed GPU operator version. When the
+// operator deployment is found but its only version source is a digest-pinned
+// image with no tag, it returns an empty version and that image reference.
+func getGPUOperatorVersion(ctx context.Context, clientset kubernetes.Interface) (string, string, error) {
 	deploymentNames := []string{gpuOperatorNamespace, "nvidia-gpu-operator"}
 	namespaces := []string{gpuOperatorNamespace, "nvidia-gpu-operator", "kube-system"}
 
 	var lastErr error
+	pinnedImage := ""
 	for _, ns := range namespaces {
 		for _, name := range deploymentNames {
-			version, err := getVersionFromDeployment(ctx, clientset, ns, name)
+			version, pinned, err := getVersionFromDeployment(ctx, clientset, ns, name)
 			if err == nil && version != "" {
-				return version, nil
+				return version, "", nil
+			}
+			if err == nil && pinned != "" && pinnedImage == "" {
+				pinnedImage = pinned
 			}
 			if err != nil {
 				lastErr = err
@@ -96,47 +114,76 @@ func getGPUOperatorVersion(ctx context.Context, clientset kubernetes.Interface) 
 		}
 	}
 
-	return "", errors.Wrap(errors.ErrCodeNotFound,
+	if pinnedImage != "" {
+		return "", pinnedImage, nil
+	}
+
+	return "", "", errors.Wrap(errors.ErrCodeNotFound,
 		"could not find GPU operator deployment in common namespaces", lastErr)
 }
 
-func getVersionFromDeployment(ctx context.Context, clientset kubernetes.Interface, namespace, name string) (string, error) {
+// getVersionFromDeployment reads the operator version from one deployment.
+// When no strategy yields a version but the operator image is pinned by
+// digest alone, it returns an empty version, that image, and no error.
+func getVersionFromDeployment(ctx context.Context, clientset kubernetes.Interface, namespace, name string) (string, string, error) {
 	deployment, err := clientset.AppsV1().Deployments(namespace).Get(ctx, name, metav1.GetOptions{})
 	if err != nil {
-		return "", errors.Wrap(errors.ErrCodeNotFound,
+		return "", "", errors.Wrap(errors.ErrCodeNotFound,
 			fmt.Sprintf("failed to get deployment %s/%s", namespace, name), err)
 	}
 
 	// Strategy 1: Check standard version label
 	if version, ok := deployment.Labels["app.kubernetes.io/version"]; ok && version != "" {
-		return normalizeVersion(version), nil
+		return normalizeVersion(version), "", nil
 	}
 
 	// Strategy 2: Parse version from container image tag
+	pinnedImage := ""
 	for _, container := range deployment.Spec.Template.Spec.Containers {
 		if strings.Contains(container.Image, "gpu-operator") {
 			version := extractVersionFromImage(container.Image)
 			if version != "" {
-				return version, nil
+				return version, "", nil
+			}
+			if tag, digest := parseImageReference(container.Image); tag == "" && digest != "" && pinnedImage == "" {
+				pinnedImage = container.Image
 			}
 		}
 	}
 
 	// Strategy 3: Check annotations
 	if version, ok := deployment.Annotations["nvidia.com/gpu-operator-version"]; ok && version != "" {
-		return normalizeVersion(version), nil
+		return normalizeVersion(version), "", nil
 	}
 
-	return "", errors.New(errors.ErrCodeNotFound,
+	if pinnedImage != "" {
+		return "", pinnedImage, nil
+	}
+
+	return "", "", errors.New(errors.ErrCodeNotFound,
 		fmt.Sprintf("could not determine version from deployment %s/%s", namespace, name))
 }
 
-func extractVersionFromImage(image string) string {
-	idx := strings.LastIndex(image, ":")
-	if idx == -1 {
-		return ""
+// parseImageReference splits an image reference into its tag and digest,
+// either of which may be empty. It accepts repo:tag, repo@sha256:..., and
+// repo:tag@sha256:..., and does not mistake a registry port for a tag.
+func parseImageReference(image string) (tag, digest string) {
+	image = strings.TrimSpace(image)
+	if at := strings.Index(image, "@"); at != -1 {
+		digest = image[at+1:]
+		image = image[:at]
 	}
-	tag := image[idx+1:]
+	slash := strings.LastIndex(image, "/")
+	if colon := strings.LastIndex(image, ":"); colon > slash {
+		tag = image[colon+1:]
+	}
+	return tag, digest
+}
+
+// extractVersionFromImage returns the normalized version from the image tag,
+// or "" when the reference has no tag (including a digest-only reference).
+func extractVersionFromImage(image string) string {
+	tag, _ := parseImageReference(image)
 	if tag == "" {
 		return ""
 	}
